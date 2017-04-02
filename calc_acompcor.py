@@ -1,4 +1,4 @@
-#!/usr/bin/env python2
+ #!/usr/bin/env python2
 # -*- coding: utf-8 -*-
 """
 Created on Mon Oct 17 14:14:22 2016
@@ -11,154 +11,76 @@ calc_acompcor
 import os
 import nibabel as nb
 import numpy as np
-from nipype.interfaces.spm.preprocess import Realign, Coregister
-from nipype.interfaces.spm.utils import Analyze2nii, ApplyInverseDeformation
-from nipype.utils.filemanip import list_to_filename
-
+from nipype.interfaces.spm.preprocess import Realign, Coregister, Normalize12
+from nipype.interfaces.spm.utils import Analyze2nii
 from SPMCustom import NewSegment
 
 from nipype.pipeline.engine import Node, Workflow
-
-from nilearn.image import resample_img, threshold_img
-from nilearn.masking import apply_mask, intersect_masks
-from skimage.morphology import binary_erosion
-from sklearn.decomposition import PCA
+from nipype.interfaces.utility import Function
 
 from joblib import Parallel, delayed
+import nibabel as nib
 
+def convert_to_4d(functional_data):
 
-def short_pipeline(functional_data, anatomical_data):
-
-    spm_path = '/home/egill/matlabtools/spm12/'
-    alvin_path = '/home/egill/'
-    working_dir = '/home/egill/global_vs_acompcor/working_dir'
-    
-    realigner = Node(interface = Realign(register_to_mean=True), 
-                     name = 'realigner')
-    realigner.inputs.in_files = functional_data
-    
-    
-    coregister = Node(interface = Coregister(), name = 'coregister')
-    coregiser.inputs.jobtype = 'estimate'
-    coregister.inputs.source =  anatomical_data
-    
-    
-    segment = Node(interface = NewSegment(), name = 'segment')
-    segment.inputs.channel_info = (0.001, 60, (True, True))
-    segment.inputs.write_deformation_fields = (True, True)
-    tpm = os.path.join(spm_path,'tpm/TPM.nii')
-    tissue1 = ((tpm, 1), 1, (True, False), (False, False))
-    tissue2 = ((tpm, 2), 1, (True, False), (False, False))
-    tissue3 = ((tpm, 3), 2, (True, False), (False, False))
-    tissue4 = ((tpm, 4), 3, (False, False), (False, False))
-    tissue5 = ((tpm, 5), 4, (False, False), (False, False))
-    tissue6 = ((tpm, 6), 2, (False, False), (False, False))
-    segment.inputs.tissues = [tissue1, tissue2, tissue3, tissue4, 
-                              tissue5, tissue6]
-    segment.inputs.affine_regularization = 'mni'
-    
-    alvin_to_nifti = Node(interface = Analyze2nii(),
-                          name = 'alvin_to_nifti')
-    
-    alvin_to_native = Node(interface = ApplyInverseDeformation(),
-                           name = 'alvin_to_native')
-    
-    preproc = Workflow(name = 'preproc')
-    preproc.base_dir = working_dir
-    
-    preproc.connect([(realigner, coregister, [('mean_image',
-                                               'target')]),
-                    (coregister, segment, [('coregistered_source', 
-                                            'channel_files')]),
-                    (alvin_to_nifti, alvin_to_native, [('nifti_file',
-                                                        list_to_filename,
-                                                        'in_files')]),
-                    (segment, alvin_to_native, [('inverse_deformation_field',
-                                                 'deformation_field')])                  
-                    ])
-    
-    
-    
-    #load smoothed data from subject
-    smoothed_filter = 'sw'
-
-
-    fnames_smoothed = [fn for  fn in os.listdir(smoothed_dir)
-            if fn.startswith(smoothed_filter)]
-    fnames_smoothed.sort()
-
-    for idx2 in xrange(0,len(fnames_smoothed)):
-        fname_abspath = os.path.join(smoothed_dir,fnames_smoothed[idx2])
-        img = nb.load(fname_abspath)
+    for idx in xrange(0,len(functional_data)):
+        img = nib.load(functional_data[idx])
         affine = img.affine
         header = img.header
         data = img.get_data()
-
-        if idx2 is 0:
-            smoothed_data=data
-            smoothed_data = smoothed_data[...,np.newaxis]
+        
+        if idx is 0:
+            all_data = data
+            all_data = all_data[..., np.newaxis]
         else:
-            smoothed_data = np.concatenate((smoothed_data,
-                                            data[...,np.newaxis]),axis=-1)
-    smoothed_img = nb.Nifti1Image(smoothed_data,affine, header)
-    return smoothed_img
+            all_data = np.concatenate((all_data, data[..., np.newaxis]), 
+                                      axis = -1)
+    functional_4d_data = nib.Nifti1Image(all_data, affine, header)
 
-def load_masks(t1_dir,each):
+    return functional_4d_data
 
-    #load csf and wm mask and reslice to match subject fmri data
-    csf_filter = list(['wc3'])
-    wm_filter = list(['wc2'])
-
-    #subject specific dir
-    subj_dir = os.path.join(t1_dir, each)
-
-
-    fname_csf = [fn for  fn in os.listdir(subj_dir)
-            if fn.startswith(csf_filter[0])]
-
-    fname_wm = [fn for  fn in os.listdir(subj_dir)
-            if fn.startswith(wm_filter[0])]
-
-    fname_csf = os.path.join(subj_dir,fname_csf[0])
-    fname_wm = os.path.join(subj_dir,fname_wm[0])
-
-    csf_mask = nb.load(fname_csf)
-    wm_mask = nb.load(fname_wm)
-    masks = [csf_mask, wm_mask]
-
-    return masks
-
-def calc_noise_timeseries(masks, smooth_img, ventricles):
-    csf_mask = masks[0]
-    wm_mask = masks[1]
-
-    csf_rs = resample_img(csf_mask,target_affine=smooth_img.affine,
-                          target_shape=smooth_img.shape[:-1],
+def calc_noise_timeseries(masks, functional_images, ventricle_mask):
+    from calc_acompcor import convert_to_4d
+    import numpy as np
+    import nibabel as nib
+    from sklearn.decomposition import PCA
+    from skimage.morphology import binary_erosion
+    from nilearn.image import resample_img
+    csf_mask = nib.load(masks[2][0])
+    wm_mask = nib.load(masks[1][0])
+    
+    if len(functional_images) > 1: 
+        functional_image = convert_to_4d(functional_images)
+    
+    csf_rs = resample_img(csf_mask,target_affine=functional_image.affine,
+                          target_shape=functional_image.shape[:-1],
                           interpolation='nearest')
-    wm_rs = resample_img(wm_mask,target_affine=smooth_img.affine,
-                         target_shape=smooth_img.shape[:-1],
+    wm_rs = resample_img(wm_mask,target_affine=functional_image.affine,
+                         target_shape=functional_image.shape[:-1],
                          interpolation='nearest')
 
     # reduce masks to voxels with 99% probability or higher
     csf_rs = csf_rs.get_data() >=0.99
     wm_rs = wm_rs.get_data() >=0.99
 
-
-    smoothed_data = np.squeeze(smooth_img.get_data())
-    ventricles = resample_img(ventricles,target_affine=smooth_img.affine,
-                              target_shape = smoothed_data.shape[:-1],
+    
+    
+    functional_data = np.squeeze(functional_image.get_data())
+    ventricle_mask = resample_img(ventricle_mask, 
+                                  target_affine=functional_image.affine,
+                              target_shape = functional_data.shape[:-1],
                                 interpolation='nearest')
-    ventdata = ventricles.get_data()
+    ventdata = ventricle_mask.get_data() > 50
 
     # intersect csf with ventricles
     csf_rs = csf_rs & ventdata
 
     # get time series data
-    csf_ts = smoothed_data[csf_rs>0]
+    csf_ts = functional_data[csf_rs>0]
 
     wm_rs = binary_erosion(wm_rs)
 
-    wm_ts = smoothed_data[wm_rs>0]
+    wm_ts = functional_data[wm_rs>0]
 
     X_csf = csf_ts.T
     X_wm = wm_ts.T
@@ -172,18 +94,52 @@ def calc_noise_timeseries(masks, smooth_img, ventricles):
     pca = PCA()
 
     components_csf = pca.fit(X_csf.T).components_
+    csf_explained_var = pca.explained_variance_ratio_
+    
+    
     components_wm = pca.fit(X_wm.T).components_
+    wm_explained_var = pca.explained_variance_ratio_
+    
+    csf_num_components_50 = np.argmax(np.cumsum(csf_explained_var) > 0.5 )
+    wm_num_components_50 = np.argmax(np.cumsum(wm_explained_var) > 0.5 )
+    csf_50 = components_csf[:,:csf_num_components_50]
+    wm_50 = components_wm[:,:wm_num_components_50] 
+    
+    wm_mask = nib.Nifti1Image(wm_rs, affine=functional_image.affine,
+                             header = functional_image.header)
+    csf_mask = nib.Nifti1Image(csf_rs, affine=functional_image.affine,
+                              header = functional_image.header)
+    
+    nib.save(wm_mask, 'wm_mask.nii')
+    nib.save(csf_mask, 'csf_mask.nii')
 
-    wm_mask = nb.Nifti1Image(wm_rs, affine=smooth_img.affine,
-                             header = smooth_img.header)
-    csf_mask = nb.Nifti1Image(csf_rs, affine=smooth_img.affine,
-                              header = smooth_img.header)
-    masks = [wm_mask, csf_mask]
+    np.savetxt('all_csf_components.txt', components_csf, fmt='%.10f')
+    np.savetxt('all_wm_components.txt', components_wm, fmt='%.10f')
+    
+    np.savetxt('50_percent_csf_components.txt', csf_50, fmt='%.10f')
+    np.savetxt('50_percent_wm_components.txt', wm_50, fmt='%.10f')
+    
+    out_masks = [wm_mask, csf_mask]
 
-    return components_csf, components_wm, masks
+    return components_csf, components_wm, out_masks
 
-def calc_global(brain_mask_path,data_img):
-
+def calc_global(masks,functional_images):
+    from calc_acompcor import convert_to_4d
+    from nilearn.image import resample_img
+    import nibabel as nib
+    
+    if len(functional_images) > 1: 
+        functional_image = convert_to_4d(functional_images)
+    
+    
+    gray_matter = nib.load(masks[0][0]).get_data() > 0
+    white_matter = nib.load(masks[1][0]).get_data() > 0
+    csf = nib.load(masks[2][0]).get_data() > 0
+    
+    brain = gray_matter + white_matter + csf
+    
+    
+    
     brain_img = nb.load(brain_mask_path)
 
 
@@ -206,7 +162,77 @@ def calc_global(brain_mask_path,data_img):
 
     return global_signal
 
+def short_pipeline(functional_data, anatomical_data):
 
+    spm_path = '/home/egill/matlabtools/spm12/'
+    alvin_path = '/home/egill/global_vs_acompcor/alvin_mask/ALVIN_mask_v1.hdr'
+    working_dir = '/home/egill/global_vs_acompcor/working_dir'
+    
+    from nipype import config
+    config.set('execution', 'remove_unnecessary_outputs', 'False')  
+    
+    
+    realigner = Node(interface = Realign(register_to_mean=True), 
+                     name = 'realigner')
+    realigner.inputs.in_files = functional_data
+    
+    
+    coregister = Node(interface = Coregister(), name = 'coregister')
+    coregister.inputs.jobtype = 'estimate'
+    coregister.inputs.source =  anatomical_data
+    
+    
+    segment = Node(interface = NewSegment(), name = 'segment')
+    segment.inputs.channel_info = (0.001, 60, (True, True))
+    segment.inputs.write_deformation_fields = [True, True]
+    tpm = os.path.join(spm_path,'tpm/TPM.nii')
+    tissue1 = ((tpm, 1), 1, (True, False), (False, False))
+    tissue2 = ((tpm, 2), 1, (True, False), (False, False))
+    tissue3 = ((tpm, 3), 2, (True, False), (False, False))
+    tissue4 = ((tpm, 4), 3, (False, False), (False, False))
+    tissue5 = ((tpm, 5), 4, (False, False), (False, False))
+    tissue6 = ((tpm, 6), 2, (False, False), (False, False))
+    segment.inputs.tissues = [tissue1, tissue2, tissue3, tissue4, 
+                              tissue5, tissue6]
+    segment.inputs.affine_regularization = 'mni'
+    
+    alvin_to_nifti = Node(interface = Analyze2nii(),
+                          name = 'alvin_to_nifti')
+    alvin_to_nifti.inputs.analyze_file = alvin_path
+    
+    alvin_to_native = Node(interface = Normalize12(),
+                           name = 'alvin_to_native')
+    alvin_to_native.inputs.jobtype = 'write'
+    
+    calc_acompcor = Node(interface = Function(input_names = \
+                            ['masks', 'functional_images', 'ventricle_mask'],
+                        output_names = ['components_csf', 'components_wm',
+                                   'out_masks'],
+                                   function = calc_noise_timeseries),
+                        name = 'calc_acompcor')
+    
+    
+    preproc = Workflow(name = 'preproc')
+    preproc.base_dir = working_dir
+    
+    preproc.connect([(realigner, coregister, [('mean_image',
+                                               'target')]),
+                    (coregister, segment, [('coregistered_source', 
+                                            'channel_files')]),
+                    (alvin_to_nifti, alvin_to_native, [('nifti_file',
+                                                        'apply_to_files')]),
+                    (segment, alvin_to_native, [('inverse_deformation_field',
+                                                 'deformation_file')]),
+                    (segment, calc_acompcor, [('native_class_images',
+                                               'masks')]),
+                    (realigner, calc_acompcor, [('realigned_files',
+                                                 'functional_images')]),
+                    (alvin_to_native, calc_acompcor, [('normalized_files',
+                                                       'ventricle_mask')])
+                    ])
+    
+        
+    preproc.run('MultiProc')
 
 
 def run(idx,each,data_dir):
@@ -218,24 +244,15 @@ def run(idx,each,data_dir):
     functional_folder = os.path.join(data_dir, subject)
     anatomical_folder = os.path.join(data_dir, subject, 'T1Img')
     
-    functional_data = [os.path.abspath(fn) for fn in os.listdir(functional_folder)
+    functional_data = [os.path.join(functional_folder,fn) for fn in os.listdir(functional_folder)
                         if fn.endswith('.nii')]
     functional_data.sort()
-    anatomical_data = [os.path.abspath(fn) for fn in
+    anatomical_data = [os.path.join(anatomical_folder,fn) for fn in
                        os.listdir(anatomical_folder) if fn.endswith('.nii')]
     
     short_pipeline(functional_data, anatomical_data)
     
-    smoothed_dir = os.path.join(data_dir,'filtered')
-    subj_dir = os.path.join(smoothed_dir, each)
-    mask_dir = os.path.join(data_dir, 'segment')
-    t1_dir = mask_dir
 
-    smooth = load_data(subj_dir)
-    masks = load_masks(t1_dir,each)
-
-    vent_fname = '/data/eaxfjord/fmriRSWorkingDir/nipype/data/masks/ventricles/ventricles.nii'
-    ventricles = nb.load(vent_fname)
 
     comp_csf, comp_wm, masks = calc_noise_timeseries(masks, smooth,
                                               ventricles)
@@ -265,10 +282,11 @@ def run(idx,each,data_dir):
 
     return corr, components,  global_signal
 
+if __name__ == "__main__":
+    
+    data_dir = '/data/eaxfjord/fmriRSWorkingDir/nipype/output_dir_PreProc_Final/'
+    subject_dir = os.path.join(data_dir,'filtered')
+    subject_list= sorted(os.listdir(subject_dir)) #all subjects included in the study
 
-data_dir = '/data/eaxfjord/fmriRSWorkingDir/nipype/output_dir_PreProc_Final/'
-subject_dir = os.path.join(data_dir,'filtered')
-subject_list= sorted(os.listdir(subject_dir)) #all subjects included in the study
-
-results = Parallel(n_jobs=6)(delayed(run)(idx,each,data_dir)
+    results = Parallel(n_jobs=6)(delayed(run)(idx,each,data_dir)
             for idx,each in enumerate(subject_list))
