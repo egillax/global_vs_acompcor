@@ -11,6 +11,14 @@ calc_acompcor
 import os
 import nibabel as nb
 import numpy as np
+from nipype.interfaces.spm.preprocess import Realign, Coregister
+from nipype.interfaces.spm.utils import Analyze2nii, ApplyInverseDeformation
+from nipype.utils.filemanip import list_to_filename
+
+from SPMCustom import NewSegment
+
+from nipype.pipeline.engine import Node, Workflow
+
 from nilearn.image import resample_img, threshold_img
 from nilearn.masking import apply_mask, intersect_masks
 from skimage.morphology import binary_erosion
@@ -19,8 +27,58 @@ from sklearn.decomposition import PCA
 from joblib import Parallel, delayed
 
 
-def load_data(smoothed_dir):
+def short_pipeline(functional_data, anatomical_data):
 
+    spm_path = '/home/egill/matlabtools/spm12/'
+    alvin_path = '/home/egill/'
+    working_dir = '/home/egill/global_vs_acompcor/working_dir'
+    
+    realigner = Node(interface = Realign(register_to_mean=True), 
+                     name = 'realigner')
+    realigner.inputs.in_files = functional_data
+    
+    
+    coregister = Node(interface = Coregister(), name = 'coregister')
+    coregiser.inputs.jobtype = 'estimate'
+    coregister.inputs.source =  anatomical_data
+    
+    
+    segment = Node(interface = NewSegment(), name = 'segment')
+    segment.inputs.channel_info = (0.001, 60, (True, True))
+    segment.inputs.write_deformation_fields = (True, True)
+    tpm = os.path.join(spm_path,'tpm/TPM.nii')
+    tissue1 = ((tpm, 1), 1, (True, False), (False, False))
+    tissue2 = ((tpm, 2), 1, (True, False), (False, False))
+    tissue3 = ((tpm, 3), 2, (True, False), (False, False))
+    tissue4 = ((tpm, 4), 3, (False, False), (False, False))
+    tissue5 = ((tpm, 5), 4, (False, False), (False, False))
+    tissue6 = ((tpm, 6), 2, (False, False), (False, False))
+    segment.inputs.tissues = [tissue1, tissue2, tissue3, tissue4, 
+                              tissue5, tissue6]
+    segment.inputs.affine_regularization = 'mni'
+    
+    alvin_to_nifti = Node(interface = Analyze2nii(),
+                          name = 'alvin_to_nifti')
+    
+    alvin_to_native = Node(interface = ApplyInverseDeformation(),
+                           name = 'alvin_to_native')
+    
+    preproc = Workflow(name = 'preproc')
+    preproc.base_dir = working_dir
+    
+    preproc.connect([(realigner, coregister, [('mean_image',
+                                               'target')]),
+                    (coregister, segment, [('coregistered_source', 
+                                            'channel_files')]),
+                    (alvin_to_nifti, alvin_to_native, [('nifti_file',
+                                                        list_to_filename,
+                                                        'in_files')]),
+                    (segment, alvin_to_native, [('inverse_deformation_field',
+                                                 'deformation_field')])                  
+                    ])
+    
+    
+    
     #load smoothed data from subject
     smoothed_filter = 'sw'
 
@@ -152,7 +210,22 @@ def calc_global(brain_mask_path,data_img):
 
 
 def run(idx,each,data_dir):
-    print each
+    
+    
+    subject_list = ['con001_T1', 'con002_T1', 'con003_T1']
+    subject = subject_list[0]
+    data_dir = '/home/egill/Dropbox/test_data/'
+    functional_folder = os.path.join(data_dir, subject)
+    anatomical_folder = os.path.join(data_dir, subject, 'T1Img')
+    
+    functional_data = [os.path.abspath(fn) for fn in os.listdir(functional_folder)
+                        if fn.endswith('.nii')]
+    functional_data.sort()
+    anatomical_data = [os.path.abspath(fn) for fn in
+                       os.listdir(anatomical_folder) if fn.endswith('.nii')]
+    
+    short_pipeline(functional_data, anatomical_data)
+    
     smoothed_dir = os.path.join(data_dir,'filtered')
     subj_dir = os.path.join(smoothed_dir, each)
     mask_dir = os.path.join(data_dir, 'segment')
