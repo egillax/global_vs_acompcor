@@ -40,6 +40,7 @@ def convert_to_4d(functional_data):
     return functional_4d_data
 
 def calc_noise_timeseries(masks, functional_images, ventricle_mask):
+    from calc_acompcor import acompcor_nipype
     from calc_acompcor import convert_to_4d
     import numpy as np
     import nibabel as nib
@@ -48,6 +49,8 @@ def calc_noise_timeseries(masks, functional_images, ventricle_mask):
     from nilearn.image import resample_img
     csf_mask = nib.load(masks[2][0])
     wm_mask = nib.load(masks[1][0])
+    gm_mask = nib.load(masks[0][0])
+    
     
     if len(functional_images) > 1: 
         functional_image = convert_to_4d(functional_images)
@@ -58,11 +61,15 @@ def calc_noise_timeseries(masks, functional_images, ventricle_mask):
     wm_rs = resample_img(wm_mask,target_affine=functional_image.affine,
                          target_shape=functional_image.shape[:-1],
                          interpolation='nearest')
+    gm_rs = resample_img(gm_mask,target_affine=functional_image.affine,
+                         target_shape=functional_image.shape[:-1],
+                         interpolation='nearest')
+    
 
     # reduce masks to voxels with 99% probability or higher
     csf_rs = csf_rs.get_data() >=0.99
     wm_rs = wm_rs.get_data() >=0.99
-
+    gm_rs = gm_rs.get_data() >=0.99
     
     
     functional_data = np.squeeze(functional_image.get_data())
@@ -81,29 +88,13 @@ def calc_noise_timeseries(masks, functional_images, ventricle_mask):
     wm_rs = binary_erosion(wm_rs)
 
     wm_ts = functional_data[wm_rs>0]
-
-    X_csf = csf_ts.T
-    X_wm = wm_ts.T
-
-    stdCSF = np.std(X_csf,axis=0)
-    stdWM = np.std(X_wm,axis=0)
-
-    X_csf = (X_csf - np.mean(X_csf,axis=0))/(stdCSF + 1e-6)
-    X_wm = (X_wm - np.mean(X_wm,axis=0))/(stdWM + 1e-6)
-
-    pca = PCA()
-
-    components_csf = pca.fit(X_csf.T).components_
-    csf_explained_var = pca.explained_variance_ratio_
     
+    gm_ts = functional_data[gm_rs>0]
+
     
-    components_wm = pca.fit(X_wm.T).components_
-    wm_explained_var = pca.explained_variance_ratio_
-    
-    csf_num_components_50 = np.argmax(np.cumsum(csf_explained_var) > 0.5 )
-    wm_num_components_50 = np.argmax(np.cumsum(wm_explained_var) > 0.5 )
-    csf_50 = components_csf[:,:csf_num_components_50]
-    wm_50 = components_wm[:,:wm_num_components_50] 
+    components_wm = acompcor_nipype(wm_ts)
+    components_csf = acompcor_nipype(csf_ts)
+  
     
     wm_mask = nib.Nifti1Image(wm_rs, affine=functional_image.affine,
                              header = functional_image.header)
@@ -113,19 +104,21 @@ def calc_noise_timeseries(masks, functional_images, ventricle_mask):
     nib.save(wm_mask, 'wm_mask.nii')
     nib.save(csf_mask, 'csf_mask.nii')
 
-    np.savetxt('all_csf_components.txt', components_csf, fmt='%.10f')
-    np.savetxt('all_wm_components.txt', components_wm, fmt='%.10f')
-    
-    np.savetxt('50_percent_csf_components.txt', csf_50, fmt='%.10f')
-    np.savetxt('50_percent_wm_components.txt', wm_50, fmt='%.10f')
+    np.savetxt('csf_components.txt', components_csf, fmt='%.10f')
+    np.savetxt('wm_components.txt', components_wm, fmt='%.10f')
+        
+    np.savetxt('all_wm_timeseries.txt', wm_ts, fmt='%.10f')
+    np.savetxt('all_csf_timeseries.txt', csf_ts, fmt='%.10f')
+    np.savetxt('all_gm_timeseries.txt', gm_ts, fmt='%.10f')
     
     out_masks = [wm_mask, csf_mask]
-
-    return components_csf, components_wm, out_masks
+    components = np.column_stack((components_csf, components_wm))
+    return components, out_masks
 
 def calc_global(masks,functional_images):
     from calc_acompcor import convert_to_4d
     from nilearn.image import resample_img
+    import numpy as np
     import nibabel as nib
     
     if len(functional_images) > 1: 
@@ -138,20 +131,19 @@ def calc_global(masks,functional_images):
     
     brain = gray_matter + white_matter + csf
     
-    
-    
-    brain_img = nb.load(brain_mask_path)
+    affine = nib.load(masks[0][0]).affine
+    header = nib.load(masks[0][0]).header
+    brain_img = nib.Nifti1Image(brain, affine, header)
+      
 
-
-
-    brain_rs = resample_img(brain_img,target_affine=data_img.affine,
-                          target_shape=data_img.shape[:-1],
+    brain_rs = resample_img(brain_img,target_affine=functional_image.affine,
+                          target_shape=functional_image.shape[:-1],
                           interpolation='nearest')
 
     brain_data = brain_rs.get_data()
     brain = brain_data >= 0.5
 
-    data = data_img.get_data()
+    data = functional_image.get_data()
 
     brain_ts  = data[brain]
     std_brain = np.std(brain_ts.T,axis=0)
@@ -160,7 +152,99 @@ def calc_global(masks,functional_images):
 
     global_signal = np.mean(x_global,1)
 
-    return global_signal
+    nib.save(brain_rs, 'brain_mask.nii')
+    np.savetxt('global_signal.txt', global_signal, fmt = '%.10f')
+    
+    global_signal = global_signal[...,np.newaxis]
+    
+    return global_signal , brain_rs
+
+
+def glm(csf_components, wm_components, global_signal):
+    import statsmodels.api as sm
+    
+    y = global_signal
+    X = wm_components
+    X = sm.add_constant(X)
+    
+    model = sm.OLS(y, X)
+    results = model.fit()
+    
+    print results
+    
+    
+def nuisance_regress(regressors, brainmask, functional_images):
+    import os
+    from calc_acompcor import convert_to_4d
+    import nibabel as nib
+    import numpy as np
+    
+    if len(functional_images) > 1: 
+        functional_image = convert_to_4d(functional_images) 
+    
+    functional_data = functional_image.get_data()
+    
+    mask_data = brainmask.get_data()
+    
+    ijk = mask_data==1
+    
+    timeseries = functional_data[ijk].T
+    
+    x, _, _, _ = np.linalg.lstsq(regressors, timeseries)
+    
+    timeseries_hat = np.dot(regressors,x)
+    
+    residuals = timeseries - timeseries_hat
+    
+    indexes = np.where(mask_data==1)
+    
+    rebuilt_array = np.zeros(functional_data.shape)
+    rebuilt_array[indexes[0], indexes[1], indexes[2]] = residuals.T
+    
+    residuals_image = nib.Nifti1Image(rebuilt_array, functional_image.affine,
+                                      functional_image.header)
+    
+    out_file = os.path.join(os.getcwd(), 'residuals.nii')
+    nib.save(residuals_image, out_file)
+    
+    return out_file
+        
+def corr_each_voxel(global_residuals, acompcor_residuals, brainmask):
+    import nibabel as nib
+    import numpy as np
+    import os
+    
+    global_data = global_residuals.get_data()
+    acompcor_data = acompcor_residuals.get_data()
+    
+    mask_data = brainmask.get_data()
+    
+    ijk = mask_data==1
+    
+    timeseries_global = global_data[ijk].T
+    timeseries_acompcor = acompcor_data[ijk].T
+
+
+    corr = np.zeros(timeseries_global.shape[1])
+    for i in xrange(timeseries_global.shape[1]):
+        corr[i] = np.corrcoef(timeseries_global[:,i], 
+            timeseries_acompcor[:,i])[0,1]
+    
+    
+    indexes = np.where(mask_data==1)
+    rebuilt_array = np.zeros(global_data.shape[:-1])
+    rebuilt_array[indexes[0], indexes[1], indexes[2]] = corr
+
+    corr_image = nib.Nifti1Image(rebuilt_array, global_residuals.affine,
+                                      global_residuals.header)
+    
+    out_file = os.path.join(os.getcwd(), 'correlations.nii')
+    nib.save(corr_image, out_file)     
+        
+        
+    
+
+ 
 
 def short_pipeline(functional_data, anatomical_data):
 
@@ -206,10 +290,22 @@ def short_pipeline(functional_data, anatomical_data):
     
     calc_acompcor = Node(interface = Function(input_names = \
                             ['masks', 'functional_images', 'ventricle_mask'],
-                        output_names = ['components_csf', 'components_wm',
-                                   'out_masks'],
+                        output_names = ['components','out_masks'],
                                    function = calc_noise_timeseries),
                         name = 'calc_acompcor')
+    
+    calc_global_signal = Node(interface = Function(
+            input_names = ['masks', 'functional_images'], 
+            output_names = ['global_signal', 'brain_img'], 
+            function = calc_global), name = 'calc_global_signal')
+    
+    regressor = Node(interface = Function(
+            input_names = ['regressors', 'brainmask', 'functional_images'],
+            output_names = 'out_file', function = nuisance_regress),
+        name = 'regressor')
+    
+    regressor_global = regressor.clone(name='global_regress')
+    
     
     
     preproc = Workflow(name = 'preproc')
@@ -228,11 +324,50 @@ def short_pipeline(functional_data, anatomical_data):
                     (realigner, calc_acompcor, [('realigned_files',
                                                  'functional_images')]),
                     (alvin_to_native, calc_acompcor, [('normalized_files',
-                                                       'ventricle_mask')])
+                                                       'ventricle_mask')]),
+                    (realigner, calc_global_signal, 
+                     [('realigned_files', 'functional_images')]),
+                     (segment, calc_global_signal, [('native_class_images',
+                                                     'masks')]),
+                    (calc_acompcor, regressor, [('components', 'regressors')]),
+                    (calc_global_signal, regressor, [('brain_img', 'brainmask')]),
+                    (realigner, regressor, [('realigned_files', 
+                                             'functional_images')]),
+                    (calc_global_signal, regressor_global, [('global_signal', 
+                                                        'regressors')]),
+                    (calc_global_signal, regressor_global, [('brain_img', 
+                                                      'brainmask')]),
+                    (realigner, regressor_global, [('realigned_files', 
+                                             'functional_images')])
                     ])
     
-        
+    preproc.write_graph(dotfilename='graph.dot', graph2use='hierarchical',
+                        format = 'png')   
     preproc.run('MultiProc')
+    
+    
+def acompcor_nipype(voxel_timecourses):
+    from scipy import linalg
+    
+    
+    M = voxel_timecourses.T
+
+    # "Voxel time series from the noise ROI (either anatomical or tSTD) were
+    # placed in a matrix M of size Nxm, with time along the row dimension
+    # and voxels along the column dimension."
+    stdM = np.std(M, axis=0)
+        # set bad values to x
+    stdM[stdM == 0] = 1
+    stdM[np.isnan(stdM)] = 1
+    
+    M = M / stdM
+
+    # "The covariance matrix C = MMT was constructed and decomposed into its
+    # principal components using a singular value decomposition."
+    u, _, _ = linalg.svd(M, full_matrices=False)
+    components = u[:, :5]
+    
+    return components
 
 
 def run(idx,each,data_dir):
@@ -250,37 +385,15 @@ def run(idx,each,data_dir):
     anatomical_data = [os.path.join(anatomical_folder,fn) for fn in
                        os.listdir(anatomical_folder) if fn.endswith('.nii')]
     
-    short_pipeline(functional_data, anatomical_data)
+    short_pipeline(functional_data, anatomical_data)         
+    
+    
+    
     
 
 
-    comp_csf, comp_wm, masks = calc_noise_timeseries(masks, smooth,
-                                              ventricles)
 
-    t1_subj_dir = os.path.join(t1_dir,each)
-    brain_mask =  [fn for  fn in os.listdir(t1_subj_dir)
-                if fn.startswith('wBrain')]
-    brain_mask_path = os.path.join(t1_subj_dir,brain_mask[0])
-    global_signal = calc_global(brain_mask_path,smooth)
-
-    corr = np.corrcoef(comp_wm,global_signal)
-
-
-    save_loc = os.path.join(mask_dir,'FunImg', each, 'GS_test')
-
-    if not os.path.exists(save_loc):
-        os.mkdir(save_loc)
-
-    np.savetxt(os.path.join(save_loc,'csf.txt'), comp_csf,fmt='%.10f')
-    np.savetxt(os.path.join(save_loc,'wm.txt'), comp_wm, fmt='%.10f')
-    np.savetxt(os.path.join(save_loc, 'global.txt'), global_signal,
-                            fmt= '%.10f')
-    nb.save(masks[0],os.path.join(save_loc, 'wm_mask.nii'))
-    nb.save(masks[1],os.path.join(save_loc, 'csf_mask.nii'))
-
-    components = [comp_wm, comp_csf]
-
-    return corr, components,  global_signal
+    
 
 if __name__ == "__main__":
     
